@@ -80,6 +80,9 @@ extern "C"
     typedef struct
     {
         uint64_t serial_number;
+        bool write_mode;
+        uint8_t write_data;
+        uint64_t read_data;
     } rc522_tag_t;
 
     /**
@@ -122,6 +125,9 @@ extern "C"
      * @param rc522 Handle
      */
     esp_err_t rc522_destroy(rc522_handle_t rc522);
+
+    esp_err_t rc522_enable_write_mode(rc522_handle_t rc522, uint8_t data);
+    esp_err_t rc522_disable_write_mode(rc522_handle_t rc522);
 
 #ifdef __cplusplus
 }
