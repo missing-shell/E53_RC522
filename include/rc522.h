@@ -126,7 +126,7 @@ extern "C"
      */
     esp_err_t rc522_destroy(rc522_handle_t rc522);
 
-    esp_err_t rc522_enable_write_mode(rc522_handle_t rc522, uint8_t data);
+    esp_err_t rc522_enable_write_mode(rc522_handle_t rc522, uint16_t *data, uint16_t blockAddr);
     esp_err_t rc522_disable_write_mode(rc522_handle_t rc522);
 
 #ifdef __cplusplus

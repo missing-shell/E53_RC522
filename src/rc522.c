@@ -37,10 +37,13 @@ struct rc522
     bool tag_was_present_last_time;
     bool bus_initialized_by_user; /*<! Whether the bus has been initialized manually by the user, before calling rc522_create function */
     bool write_mode;
-    uint8_t write_data;
+    uint16_t write_data[16];
+    uint16_t blockAddr;
 };
 
 ESP_EVENT_DEFINE_BASE(RC522_EVENTS);
+
+static uint16_t keyA[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static esp_err_t rc522_spi_send(rc522_handle_t rc522, uint8_t *buffer, uint8_t length);
 static esp_err_t rc522_spi_receive(rc522_handle_t rc522, uint8_t *buffer, uint8_t length, uint8_t addr);
@@ -249,7 +252,6 @@ esp_err_t rc522_create(rc522_config_t *config, rc522_handle_t *out_rc522)
 
     ALLOC_RET_GUARD(rc522 = calloc(1, sizeof(struct rc522)));
     rc522->write_mode = false;
-    rc522->write_data = (uint8_t)1;
     ESP_ERR_LOG_AND_JMP_GUARD(rc522_clone_config(
                                   config,
                                   &(rc522->config)),
@@ -381,6 +383,7 @@ static esp_err_t rc522_card_write(rc522_handle_t rc522, uint8_t cmd, uint8_t *da
 {
     esp_err_t err = ESP_OK;
     uint8_t *_result = NULL;
+    uint8_t _res_n = 0;
     uint8_t irq = 0x00;
     uint8_t irq_wait = 0x00;
     uint8_t last_bits = 0;
@@ -441,31 +444,32 @@ static esp_err_t rc522_card_write(rc522_handle_t rc522, uint8_t cmd, uint8_t *da
 
                 if (last_bits != 0)
                 {
-                    *res_n = (nn - 1) + last_bits;
+                    _res_n = (nn - 1) + last_bits;
                 }
                 else
                 {
-                    *res_n = nn;
+                    _res_n = nn;
                 }
 
-                if (*res_n > 0)
+                if (_res_n > 0)
                 {
-                    ALLOC_JMP_GUARD(_result = (uint8_t *)malloc(*res_n));
+                    ALLOC_JMP_GUARD(_result = (uint8_t *)malloc(_res_n));
 
-                    for (i = 0; i < *res_n; i++)
+                    for (i = 0; i < _res_n; i++)
                     {
                         ESP_ERR_JMP_GUARD(rc522_read(rc522, RC522_FIFO_DATA_REG, &tmp));
                         _result[i] = tmp;
                     }
-
-                    *result = _result;
                 }
             }
         }
     }
-    // TO do: result并没有被赋值
-    JMP_GUARD_GATES({ *res_n = 0; },
-                    { *result = _result; });
+
+    JMP_GUARD_GATES({
+        FREE(_result);
+        _res_n = 0; }, {
+        *res_n = _res_n;
+        *result = _result; });
 
     return err;
 }
@@ -517,19 +521,36 @@ static esp_err_t rc522_anticoll(rc522_handle_t rc522, uint8_t **result)
 
     return err;
 }
+/**
+ * Transmits SELECT/ANTICOLLISION commands to select a single PICC.
+ * Before calling this function the PICCs must be placed in the READY(*) state by calling RequestA() or WakeupA().
+ * On success:
+ * 		- The chosen PICC is in state ACTIVE(*) and all other PICCs have returned to state IDLE/HALT. (Figure 7 of the ISO/IEC 14443-3 draft.)
+ * 		- The UID size and value of the chosen PICC is returned in *uid along with the SAK.
+ *
+ * A PICC UID consists of 4, 7 or 10 bytes.
+ * Only 4 bytes can be specified in a SELECT command, so for the longer UIDs two or three iterations are used:
+ * 		UID size	Number of UID bytes		Cascade levels		Example of PICC
+ * 		========	===================		==============		===============
+ * 		single				 4						1				MIFARE Classic
+ */
 static uint8_t rc522_select_tag(rc522_handle_t rc522, uint8_t *uid)
 {
     uint8_t *res_data = NULL;
     uint8_t res_data_n;
     uint8_t ret = 0;
-    uint8_t buf[] = {0x93, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t buff[9];
+    memset(buff, 0, sizeof(buff));
+    buff[0] = 0x93; // Anti collision/Select
+    buff[1] = 0x70; // NVB - Number of Valid Bits: Seven whole bytes
+
     for (uint8_t i = 0; i < 5; i++)
     {
-        buf[i + 2] = uid[i];
+        buff[i + 2] = uid[i];
     }
 
-    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buf, 7, buf + 7));
-    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buf, 9, &res_data_n, &res_data));
+    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buff, 7, buff + 7));
+    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buff, 9, &res_data_n, &res_data));
 
     free(res_data);
     return ret;
@@ -570,13 +591,23 @@ static void rc522_auth(rc522_handle_t rc522, uint8_t *uid)
 {
     uint8_t *res_data = NULL;
     uint8_t res_data_n;
+    uint8_t buff[12];
+    memset(buff, 0, sizeof(buff));
+    buff[0] = 0x60;
+    buff[1] = rc522->blockAddr;
 
-    uint8_t buf[] = {0x60, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00};
+    for (int i = 0; i < 6; i++)
+    {
+        // 6 key bytes
+        buff[i + 2] = keyA[i];
+    }
+
     for (uint8_t i = 0; i < 4; i++)
     {
-        buf[i + 8] = uid[i];
+        // The last 4 bytes of the UID
+        buff[i + 8] = uid[i];
     }
-    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0E, buf, 12, &res_data_n, &res_data));
+    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0E, buff, 12, &res_data_n, &res_data));
     if (!res_data)
     {
         free(res_data);
@@ -585,13 +616,16 @@ static void rc522_auth(rc522_handle_t rc522, uint8_t *uid)
 
 static uint64_t rc522_read_tag(rc522_handle_t rc522)
 {
+    uint8_t buff[4];
+    memset(buff, 0, sizeof(buff));
+    buff[0] = 0x30;
+    buff[1] = rc522->blockAddr;
 
-    uint8_t buf[] = {0x30, 0x04, 0x00, 0x00};
-    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buf, 2, buf + 2));
+    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buff, 2, buff + 2));
     uint8_t *res_data = NULL;
     res_data = malloc(sizeof(uint8_t) * 16);
     uint8_t res_data_n;
-    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buf, 4, &res_data_n, &res_data));
+    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buff, 4, &res_data_n, &res_data));
     uint64_t ret = 0;
     if (res_data_n > 1)
     {
@@ -604,40 +638,46 @@ static uint64_t rc522_read_tag(rc522_handle_t rc522)
     return ret;
 }
 
-static void rc522_write_tag(rc522_handle_t rc522, uint8_t write_data)
+static void rc522_write_tag(rc522_handle_t rc522)
 {
-    // uint64_t flag = 0;
     uint8_t *res_data = NULL;
     uint8_t res_data_n;
+    // 初始化相关变量
+    uint8_t buff[20];
+    memset(buff, 0, sizeof(buff));
+    // TO do：寻找一种方式避免数组越界(n+动态数组)
 
-    uint8_t buf[] = {0xA0, 0x04, 0x00, 0x00};
-    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buf, 2, buf + 2));
-    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buf, 4, &res_data_n, &res_data));
-    // if (res_data_n!=4 || (res_data[0] & 0x0F)!=0x0A)
-    //   return NULL;
-    // if (res_data_n == 4)
-    //   flag |= 1;
-    // if ((res_data[0] & 0x0F) == 0x0A)
-    //   flag |= 1<<8;
+    // 初始化写操作，发送写命令和块地址
+    buff[0] = 0xA0;
+    buff[1] = rc522->blockAddr;
+
+    ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buff, 2, buff + 2));
+    ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buff, 4, &res_data_n, &res_data));
+
+    // 检查数据是否写入成功
+    if ((res_data_n != 4) || ((res_data[0] & 0x0F) != 0x0A))
+    {
+        ESP_LOGE(TAG, "写命令写入失败, res_data_n=%d", res_data_n);
+        return;
+    }
+
     if (!res_data)
     {
         free(res_data);
     }
-    uint8_t buff[] = {0x00, 0x03, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    buff[0] = write_data;
-    // for(uint8_t i = 0; i < 1; i++) {
-    //   buff[i] = write_data[i];
-    // }
+
+    for (int i = 0; i < 16; i++)
+    {
+        buff[i] = *(rc522->write_data + i);
+    }
 
     ESP_ERROR_CHECK(rc522_calculate_crc(rc522, buff, 16, buff + 16));
 
     ESP_ERROR_CHECK(rc522_card_write(rc522, 0x0C, buff, 18, &res_data_n, &res_data));
-    // if (res_data_n == 4)
-    //   flag |= 1<<16;
-    // if ((res_data[0] & 0x0F )== 0x0A)
-    //   flag |= 1<<24;
-    // if (res_data_n!=4 || (res_data[0] & 0x0F)!=0x0A)
-    //   return NULL;
+    if ((res_data_n != 4) || ((res_data[0] & 0x0F) != 0x0A))
+    {
+        ESP_LOGE(TAG, "卡片写入失败");
+    }
     if (!res_data)
     {
         free(res_data);
@@ -911,10 +951,10 @@ static void rc522_halt(rc522_handle_t rc522)
 static void rc522_task(void *arg)
 {
     rc522_handle_t rc522 = (rc522_handle_t)arg;
-    uint64_t prev_read = 0;
-    bool prev_write_mode = false;
-    uint8_t prev_write = 0;
-    uint64_t prev_serial = 0;
+    // uint64_t prev_read = 0;
+    // bool prev_write_mode = false;
+    // uint8_t prev_write = 0;
+    // uint64_t prev_serial = 0;
 
     while (rc522->running)
     {
@@ -939,37 +979,32 @@ static void rc522_task(void *arg)
             {
                 rc522->tag_was_present_last_time = false;
             }
-            else
+            else if (!rc522->tag_was_present_last_time)
             {
                 rc522_select_tag(rc522, serial_no_array);
                 rc522_auth(rc522, serial_no_array);
                 if (rc522->write_mode)
                 {
-                    rc522_write_tag(rc522, rc522->write_data);
+                    rc522_write_tag(rc522);
                 }
+                // TO DO: rc522_read_tag目前只能读前四位
                 read_data = rc522_read_tag(rc522);
                 rc522_tag_t tag = {
                     .serial_number = rc522_sn_to_u64(serial_no_array),
                     .write_mode = rc522->write_mode,
-                    .write_data = rc522->write_data,
-                    .read_data = read_data,
                 };
                 free(serial_no_array);
-                if ((tag.write_data != prev_write) || (tag.read_data != prev_read) || (tag.write_mode != prev_write_mode) || (tag.serial_number != prev_serial))
-                {
-                    rc522_dispatch_event(rc522, RC522_EVENT_TAG_SCANNED, &tag);
-                    rc522->tag_was_present_last_time = true;
-                    prev_write = tag.write_data;
-                    prev_read = tag.read_data;
-                    prev_write_mode = tag.write_mode;
-                    prev_serial = tag.serial_number;
-                }
-                else
-                {
-                    rc522->tag_was_present_last_time = false;
-                }
+
+                rc522_dispatch_event(rc522, RC522_EVENT_TAG_SCANNED, &tag);
+                rc522->tag_was_present_last_time = true;
             }
-            rc522_halt(rc522);
+            else
+            {
+                // 如果标签之前已检测到，此次也检测到了，则仅释放内存
+                FREE(serial_no_array);
+            }
+            // 如果只需要写入一张卡，可以启用rc522_halt(rc522);,写入之后读取器停止对标签操作
+            // rc522_halt(rc522);
         }
 
         int delay_interval_ms = rc522->config->scan_interval_ms;
@@ -985,11 +1020,11 @@ static void rc522_task(void *arg)
     vTaskDelete(NULL);
 }
 
-esp_err_t rc522_enable_write_mode(rc522_handle_t rc522, uint8_t data)
+esp_err_t rc522_enable_write_mode(rc522_handle_t rc522, uint16_t *data, uint16_t blockAddr)
 {
     rc522->write_mode = true;
-    rc522->write_data = data;
-
+    memcpy(rc522->write_data, data, 16);
+    rc522->blockAddr = blockAddr;
     return ESP_OK;
 }
 
